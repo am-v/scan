@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import {
-  BrowserMultiFormatReader,
+  MultiFormatReader,
+  BinaryBitmap,
+  HTMLCanvasElementLuminanceSource,
+  HybridBinarizer,
   DecodeHintType,
   BarcodeFormat,
   NotFoundException,
@@ -25,7 +28,7 @@ const SUPPORTED_FORMATS = [
   BarcodeFormat.PDF_417,
 ];
 
-const hints = new Map();
+const hints = new Map<DecodeHintType, unknown>();
 hints.set(DecodeHintType.POSSIBLE_FORMATS, SUPPORTED_FORMATS);
 hints.set(DecodeHintType.TRY_HARDER, true);
 
@@ -54,16 +57,18 @@ export function useBarcodeScanner(): UseBarcodeScanner {
   const [flashSuccess, setFlashSuccess] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  // MultiFormatReader from @zxing/library — synchronous decode from BinaryBitmap
+  const readerRef = useRef<MultiFormatReader | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const dedupeRef = useRef(new DeduplicateCache(3000));
   const isPausedRef = useRef(false);
   const animFrameRef = useRef<number>(0);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null);
 
   const beep = useBeep();
 
-  // Sync isPaused state → ref for use inside rAF loop
+  // Sync isPaused state → ref so the rAF loop can read it without stale closure
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
@@ -90,16 +95,24 @@ export function useBarcodeScanner(): UseBarcodeScanner {
       video.setAttribute('playsinline', 'true');
       void video.play();
 
+      // Lazy-init the reader once
       if (!readerRef.current) {
-        readerRef.current = new BrowserMultiFormatReader(hints);
+        const r = new MultiFormatReader();
+        r.setHints(hints);
+        readerRef.current = r;
       }
 
-      // Lazy-create offscreen canvas for decoding
+      // Lazy-init offscreen canvas
       if (!canvasRef.current) {
         canvasRef.current = document.createElement('canvas');
+        ctx2dRef.current = canvasRef.current.getContext('2d', {
+          willReadFrequently: true,
+        });
       }
+
       const canvas = canvasRef.current;
-      const ctx2d = canvas.getContext('2d', { willReadFrequently: true });
+      const ctx2d = ctx2dRef.current;
+      const reader = readerRef.current;
 
       const tick = () => {
         if (isPausedRef.current || video.readyState < 2) {
@@ -112,7 +125,12 @@ export function useBarcodeScanner(): UseBarcodeScanner {
         ctx2d?.drawImage(video, 0, 0, canvas.width, canvas.height);
 
         try {
-          const result = readerRef.current!.decodeFromCanvas(canvas);
+          // HTMLCanvasElementLuminanceSource + HybridBinarizer is the correct
+          // low-level ZXing API when driving your own decode loop
+          const luminanceSource = new HTMLCanvasElementLuminanceSource(canvas);
+          const binaryBitmap = new BinaryBitmap(new HybridBinarizer(luminanceSource));
+          const result = reader.decode(binaryBitmap);
+
           const value = result.getText();
           const format = BarcodeFormat[result.getBarcodeFormat()] ?? 'Unknown';
 
@@ -128,9 +146,9 @@ export function useBarcodeScanner(): UseBarcodeScanner {
             flashBorder();
           }
         } catch (e) {
-          // NotFoundException is expected when no barcode in frame
+          // NotFoundException is the normal "no barcode in this frame" signal
           if (!(e instanceof NotFoundException)) {
-            // suppress other decode errors
+            // suppress other transient decode errors
           }
         }
 
@@ -170,13 +188,13 @@ export function useBarcodeScanner(): UseBarcodeScanner {
     }
 
     try {
-      // First, request with environment facing to trigger permission prompt
+      // Trigger the permission prompt with environment-facing preference
       const initialStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' } },
         audio: false,
       });
 
-      // Enumerate cameras once we have permission
+      // Enumerate cameras only after permission is granted
       const devices = await navigator.mediaDevices.enumerateDevices();
       const cameras = devices.filter((d) => d.kind === 'videoinput');
 
@@ -189,23 +207,29 @@ export function useBarcodeScanner(): UseBarcodeScanner {
       setAvailableCameras(cameras);
       setPermission('granted');
 
-      // Prefer rear camera on mobile
+      // Prefer a rear camera by label on mobile; fall back to first camera
       const rearCamera = cameras.find(
         (c) =>
-          /back|rear|environment/i.test(c.label) && !/ultra|wide|tele/i.test(c.label)
+          /back|rear|environment/i.test(c.label) &&
+          !/ultra|wide|tele/i.test(c.label)
       );
       const preferred = rearCamera ?? cameras[0];
       const preferredId = preferred?.deviceId ?? '';
       setSelectedCameraId(preferredId);
 
-      // Stop the initial stream and open with preferred camera
       initialStream.getTracks().forEach((t) => t.stop());
       await openStream(preferredId || undefined);
     } catch (err) {
       if (err instanceof Error) {
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        if (
+          err.name === 'NotAllowedError' ||
+          err.name === 'PermissionDeniedError'
+        ) {
           setPermission('denied');
-        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+        } else if (
+          err.name === 'NotFoundError' ||
+          err.name === 'DevicesNotFoundError'
+        ) {
           setPermission('no-camera');
         } else {
           setPermission('denied');
@@ -232,7 +256,7 @@ export function useBarcodeScanner(): UseBarcodeScanner {
     dedupeRef.current.clear();
   }, []);
 
-  // Cleanup on unmount
+  // Clean up media stream on unmount
   useEffect(() => {
     return () => {
       stopStream();
