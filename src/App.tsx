@@ -15,6 +15,7 @@ export default function App() {
     availableCameras,
     selectedCameraId,
     flashSuccess,
+    resultPoints,
     videoRef,
     startCamera,
     selectCamera,
@@ -236,6 +237,7 @@ export default function App() {
               selectedCameraId={selectedCameraId}
               flashSuccess={flashSuccess}
               isPaused={isPaused}
+              resultPoints={resultPoints}
               onSelectCamera={selectCamera}
             />
           </section>

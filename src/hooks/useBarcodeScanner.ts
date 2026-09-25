@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import {
   MultiFormatReader,
   BinaryBitmap,
-  HTMLCanvasElementLuminanceSource,
+  RGBLuminanceSource,
   HybridBinarizer,
   DecodeHintType,
   BarcodeFormat,
@@ -11,6 +11,8 @@ import {
 import type { CameraPermission, ScanItem } from '../types/scanner';
 import { DeduplicateCache } from '../utils/deduplicate';
 import { useBeep } from './useBeep';
+
+export interface CodePoint { x: number; y: number }
 
 const SUPPORTED_FORMATS = [
   BarcodeFormat.UPC_A,
@@ -40,6 +42,7 @@ export interface UseBarcodeScanner {
   availableCameras: MediaDeviceInfo[];
   selectedCameraId: string;
   flashSuccess: boolean;
+  resultPoints: CodePoint[] | null;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   startCamera: () => Promise<void>;
   selectCamera: (deviceId: string) => void;
@@ -55,9 +58,9 @@ export function useBarcodeScanner(): UseBarcodeScanner {
   const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
   const [selectedCameraId, setSelectedCameraId] = useState('');
   const [flashSuccess, setFlashSuccess] = useState(false);
+  const [resultPoints, setResultPoints] = useState<CodePoint[] | null>(null);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  // MultiFormatReader from @zxing/library — synchronous decode from BinaryBitmap
   const readerRef = useRef<MultiFormatReader | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const dedupeRef = useRef(new DeduplicateCache(3000));
@@ -65,16 +68,19 @@ export function useBarcodeScanner(): UseBarcodeScanner {
   const animFrameRef = useRef<number>(0);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctx2dRef = useRef<CanvasRenderingContext2D | null>(null);
+  const resultClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastOverlayUpdateRef = useRef(0);
 
   const beep = useBeep();
 
-  // Sync isPaused state → ref so the rAF loop can read it without stale closure
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
 
   const stopStream = useCallback(() => {
     cancelAnimationFrame(animFrameRef.current);
+    if (resultClearTimerRef.current) clearTimeout(resultClearTimerRef.current);
+    setResultPoints(null);
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -95,14 +101,12 @@ export function useBarcodeScanner(): UseBarcodeScanner {
       video.setAttribute('playsinline', 'true');
       void video.play();
 
-      // Lazy-init the reader once
       if (!readerRef.current) {
         const r = new MultiFormatReader();
         r.setHints(hints);
         readerRef.current = r;
       }
 
-      // Lazy-init offscreen canvas
       if (!canvasRef.current) {
         canvasRef.current = document.createElement('canvas');
         ctx2dRef.current = canvasRef.current.getContext('2d', {
@@ -120,19 +124,51 @@ export function useBarcodeScanner(): UseBarcodeScanner {
           return;
         }
 
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        ctx2d?.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const w = video.videoWidth;
+        const h = video.videoHeight;
+        if (!w || !h) {
+          animFrameRef.current = requestAnimationFrame(tick);
+          return;
+        }
+
+        canvas.width = w;
+        canvas.height = h;
+        ctx2d?.drawImage(video, 0, 0, w, h);
 
         try {
-          // HTMLCanvasElementLuminanceSource + HybridBinarizer is the correct
-          // low-level ZXing API when driving your own decode loop
-          const luminanceSource = new HTMLCanvasElementLuminanceSource(canvas);
+          // RGBLuminanceSource is more reliable than HTMLCanvasElementLuminanceSource
+          // especially for QR codes — we read raw RGBA pixel data and pack into Int32 ARGB.
+          const imageData = ctx2d!.getImageData(0, 0, w, h);
+          const rgba = imageData.data;
+          const pixelCount = w * h;
+          const int32 = new Int32Array(pixelCount);
+          for (let i = 0; i < pixelCount; i++) {
+            const r = rgba[i * 4];
+            const g = rgba[i * 4 + 1];
+            const b = rgba[i * 4 + 2];
+            // Pack as 0xFFRRGGBB (ZXing ARGB int32)
+            int32[i] = (0xFF000000 | (r << 16) | (g << 8) | b) | 0;
+          }
+          const luminanceSource = new RGBLuminanceSource(int32, w, h);
           const binaryBitmap = new BinaryBitmap(new HybridBinarizer(luminanceSource));
+
+          // reset() clears internal reader state between frames — required for
+          // reliable multi-format detection, especially QR codes.
+          reader.reset();
           const result = reader.decode(binaryBitmap);
 
           const value = result.getText();
           const format = BarcodeFormat[result.getBarcodeFormat()] ?? 'Unknown';
+
+          // Update bounding box overlay (throttled to avoid excessive re-renders)
+          const pts = result.getResultPoints();
+          const now = Date.now();
+          if (pts?.length && now - lastOverlayUpdateRef.current > 150) {
+            lastOverlayUpdateRef.current = now;
+            setResultPoints(pts.map((p) => ({ x: p.getX(), y: p.getY() })));
+            if (resultClearTimerRef.current) clearTimeout(resultClearTimerRef.current);
+            resultClearTimerRef.current = setTimeout(() => setResultPoints(null), 1000);
+          }
 
           if (!dedupeRef.current.isDuplicate(value, format)) {
             const item: ScanItem = {
@@ -146,9 +182,10 @@ export function useBarcodeScanner(): UseBarcodeScanner {
             flashBorder();
           }
         } catch (e) {
-          // NotFoundException is the normal "no barcode in this frame" signal
+          // NotFoundException is normal — no barcode visible in this frame.
+          // Other errors (ChecksumException, FormatException) are transient — suppress.
           if (!(e instanceof NotFoundException)) {
-            // suppress other transient decode errors
+            // intentionally suppressed
           }
         }
 
@@ -188,13 +225,11 @@ export function useBarcodeScanner(): UseBarcodeScanner {
     }
 
     try {
-      // Trigger the permission prompt with environment-facing preference
       const initialStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: 'environment' } },
         audio: false,
       });
 
-      // Enumerate cameras only after permission is granted
       const devices = await navigator.mediaDevices.enumerateDevices();
       const cameras = devices.filter((d) => d.kind === 'videoinput');
 
@@ -207,7 +242,6 @@ export function useBarcodeScanner(): UseBarcodeScanner {
       setAvailableCameras(cameras);
       setPermission('granted');
 
-      // Prefer a rear camera by label on mobile; fall back to first camera
       const rearCamera = cameras.find(
         (c) =>
           /back|rear|environment/i.test(c.label) &&
@@ -221,15 +255,9 @@ export function useBarcodeScanner(): UseBarcodeScanner {
       await openStream(preferredId || undefined);
     } catch (err) {
       if (err instanceof Error) {
-        if (
-          err.name === 'NotAllowedError' ||
-          err.name === 'PermissionDeniedError'
-        ) {
+        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
           setPermission('denied');
-        } else if (
-          err.name === 'NotFoundError' ||
-          err.name === 'DevicesNotFoundError'
-        ) {
+        } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
           setPermission('no-camera');
         } else {
           setPermission('denied');
@@ -256,7 +284,6 @@ export function useBarcodeScanner(): UseBarcodeScanner {
     dedupeRef.current.clear();
   }, []);
 
-  // Clean up media stream on unmount
   useEffect(() => {
     return () => {
       stopStream();
@@ -271,6 +298,7 @@ export function useBarcodeScanner(): UseBarcodeScanner {
     availableCameras,
     selectedCameraId,
     flashSuccess,
+    resultPoints,
     videoRef,
     startCamera,
     selectCamera,
