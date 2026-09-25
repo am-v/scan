@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { motion, AnimatePresence, useReducedMotion } from 'motion/react';
+import { motion, AnimatePresence, useReducedMotion, type Transition } from 'motion/react';
 import { useBarcodeScanner } from './hooks/useBarcodeScanner';
 import { CameraView } from './components/CameraView';
 import { ScanCard } from './components/ScanCard';
@@ -31,7 +31,7 @@ export default function App() {
     setTimeout(() => setCopiedId(''), 1500);
   }, []);
 
-  const transition = shouldReduceMotion
+  const transition: Transition = shouldReduceMotion
     ? { duration: 0 }
     : { duration: 0.18, ease: 'easeOut' };
 
